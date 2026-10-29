@@ -1,0 +1,8 @@
+# personal / build artifacts — never commit
+profile.json
+make_profile.py
+*.bz2
+*.gz
+venv/
+smoldata.json.br
+__pycache__/

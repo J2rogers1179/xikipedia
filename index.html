@@ -598,6 +598,8 @@
         <p>Whether to store your algorithm data locally (the data still never leaves your device). If this is turned off, your feed will start from scratch every time.</p>
         <label>Open links in English Wikipedia<input id="setting-openMainWiki" type=checkbox></label>
         <p>The articles are pulled from Simple English Wikipedia, but you can choose to still open them in (non-Simple) English Wikipedia.</p>
+        <label>Feed personalization (W)<input id="setting-W" type="range" min="0" max="10000" step="100" value="2000"></label>
+        <p>How strongly your taste vector steers the feed. Higher = more personalized to your likes; lower = more random.</p>
         <pseudo-label>Theme
         <radio-picker aria-label="Theme picker" role="radiogroup">
             <label><input type="radio" name="theme" id="theme-auto" checked>Auto</label>
@@ -606,6 +608,9 @@
         </radio-picker>
         </pseudo-label>
         <div style="flex:1"></div>
+        <button class="btn-outline" onclick=document.getElementById('importFile').click() style="margin-bottom:8px">Import profile</button>
+        <input id="importFile" type="file" accept=".json,application/json" style="display:none">
+        <button class="btn-outline" onclick=exportProfile() style="margin-bottom:8px">Export profile</button>
         <button class="btn-outline" onclick=showAboutModal() style="margin-bottom:8px">About Xikipedia</button>
         <button class="btn-danger-outline" onclick=resetAlgorithm() style="margin-bottom:8px">Reset the algorithm</button>
         <button class="btn-danger" onclick=resetEverything()>Delete all data</button>
@@ -684,8 +689,14 @@
 
     let lastSpentTime = Date.now();
 
-    const defaultCategories = ["nature", "science", "animals", "anthropology", "places", "sociology", "art", "mathematics", "games", "technology", "music", "human sexuality"];
+    const defaultCategories = ["computer security", "artificial intelligence", "cloud computing", "computer programming", "basketball", "finance", "entrepreneurship", "philosophy", "psychology", "fashion"];
     let postsWithoutLike = 0;
+
+    // ==== taste-vector personalization ====
+    let embeddings = null;               // Int8Array (N x 384)
+    const tasteVector = new Float32Array(384);
+    let W = 2000;                        // taste weight (Settings slider)
+    const EMBED_DIM = 384;
 
     const HTML_VERSION = "1.1.4";
 
@@ -693,7 +704,8 @@
         const baseSettings = {
             storeData: true,
             openMainWiki: true,
-            dataSize: 228005406,
+            dataSize: 19507933,
+            W: 2000,
             profile: "default",
             profiles: ["default"],
             theme: "theme-auto",
@@ -703,6 +715,8 @@
         document.querySelector(`#${computedSettings.theme}`).checked = true;
         document.getElementById("setting-storeData").checked = computedSettings.storeData;
         document.getElementById("setting-openMainWiki").checked = computedSettings.openMainWiki;
+        document.getElementById("setting-W").value = computedSettings.W;
+        W = computedSettings.W;
         return computedSettings;
     }
 
@@ -710,6 +724,8 @@
         settings.theme = document.querySelector('[name=theme]:checked')?.id ?? "theme-auto";
         settings.storeData = document.getElementById("setting-storeData").checked;
         settings.openMainWiki = document.getElementById("setting-openMainWiki").checked;
+        settings.W = +document.getElementById("setting-W").value;
+        W = settings.W;
         localStorage.setItem("xikipedia-settings", JSON.stringify(settings));
     }
 
@@ -754,6 +770,10 @@
     const storeDataWarning = document.getElementById("storeDataWarning");
 
     settingsModal.querySelectorAll("input").forEach(e => e.onchange = saveSettings);
+    document.getElementById("importFile").onchange = e => {
+        if (e.target.files[0]) importProfile(e.target.files[0]);
+        e.target.value = "";
+    };
 
     categorySearchInput.oninput = () => {
         const searchText = categorySearchInput.value;
@@ -809,6 +829,8 @@
         likedPosts = profile.likedPosts;
         timeSpentTotal = profile.timeSpentTotal;
         profileName = profile.profileName;
+        if (profile.tasteVector && profile.tasteVector.length === EMBED_DIM)
+            tasteVector.set(profile.tasteVector);
         pagesArr.filter(e=>e.seen).forEach(e=>e.seen=0);
         try {
             seenPosts.forEach(postId => {
@@ -834,6 +856,7 @@
             seenPosts,
             likedPosts,
             timeSpentTotal,
+            tasteVector: Array.from(tasteVector),
         }
         localStorage.setItem(`xikipedia-profile-${settings.profile}`, JSON.stringify(profile));
     }
@@ -966,6 +989,49 @@
         settingsModal.showModal();
     }
 
+    function exportProfile() {
+        const sorted = Object.entries(categoryScores).filter(e => e[1]).sort((a, b) => b[1] - a[1]);
+        const data = {
+            likes: likedPosts.map(id => pagesArr.find(e => e.id === id)?.title ?? id),
+            topCategories: sorted.slice(0, 100).map(([k, v]) => ({category: k, score: v})),
+            tasteVector: Array.from(tasteVector),
+        };
+        const blob = new Blob([JSON.stringify(data)], {type: "application/json"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "xikipedia-export.json";
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    function importProfile(file) {
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const profile = JSON.parse(reader.result);
+                if (profile.categoryScores)
+                    Object.assign(categoryScores, profile.categoryScores);
+                if (profile.goals) {
+                    const now = Date.now();
+                    profile.goals.forEach(goal => {
+                        if (goal.expires && new Date(goal.expires).getTime() < now) return;
+                        const w = goal.weight ?? 1;
+                        const vec = goal.vector;
+                        if (!vec || vec.length !== EMBED_DIM) return;
+                        for (let i = 0; i < EMBED_DIM; i++)
+                            tasteVector[i] += w * vec[i];
+                    });
+                }
+                saveProfile();
+                alert("Profile imported");
+            } catch (e) {
+                alert("Invalid profile file: " + e.message);
+            }
+        };
+        reader.readAsText(file);
+    }
+
     function showAboutModal() {
         aboutModal.showModal();
     }
@@ -1008,6 +1074,28 @@
         return amount;
     }
 
+    function cosineTaste(post) {
+        if (!embeddings || post.originalIndex == null) return 0;
+        const base = post.originalIndex * EMBED_DIM;
+        let dot = 0, tNorm = 0, eNorm = 0;
+        for (let i = 0; i < EMBED_DIM; i++) {
+            const ti = tasteVector[i];
+            const ei = embeddings[base + i];
+            dot += ti * ei;
+            tNorm += ti * ti;
+            eNorm += ei * ei;
+        }
+        if (tNorm === 0 || eNorm === 0) return 0;
+        return dot / (Math.sqrt(tNorm) * Math.sqrt(eNorm));
+    }
+
+    function updateTaste(post, weight) {
+        if (!embeddings || post.originalIndex == null) return;
+        const base = post.originalIndex * EMBED_DIM;
+        for (let i = 0; i < EMBED_DIM; i++)
+            tasteVector[i] += weight * embeddings[base + i];
+    }
+
     function showPic(imgName) {
         const fullImg = document.createElement("img");
         fullImg.src = `https://commons.wikimedia.org/w/index.php?title=Special:Redirect/file/${imgName.replace(/ /g, '_')}`;
@@ -1032,8 +1120,10 @@
         postDiv.classList.add("post");
         postDiv.onclick = () => {
             window.open(getArticleLink(nextPost.title));
-            if (!postDiv.dataset.engaged)
+            if (!postDiv.dataset.engaged) {
                 postDiv.dataset.engaged = engagePost(nextPost, 75);
+                updateTaste(nextPost, 1.5);
+            }
         };
         postTitle.innerText = nextPost.title;
         postP.innerText = nextPost.text;
@@ -1043,8 +1133,10 @@
                 postYes.dataset.liked = true;
                 likedPosts.push(nextPost.id);                    
             }
-            if (!postYes.dataset.engaged)
+            if (!postYes.dataset.engaged) {
                 postYes.dataset.engaged = engagePost(nextPost, 50 + postsWithoutLike*4);
+                updateTaste(nextPost, 1);
+            }
             postsWithoutLike = 0;
             setTimeout(saveProfile,100); 
             e.stopPropagation();
@@ -1059,8 +1151,10 @@
             postImg.onerror = () => postImg.remove();
             postImg.onclick = (e) => {
                 showPic(nextPost.thumb);
-                if (!postImg.dataset.engaged)
+                if (!postImg.dataset.engaged) {
                     postImg.dataset.engaged = engagePost(nextPost, 100);
+                    updateTaste(nextPost, 2);
+                }
                 e.stopPropagation();
             };
             postDiv.appendChild(postImg);   
@@ -1068,6 +1162,7 @@
         postDiv.appendChild(postYes);
         //nextPost.allCategories.forEach(e => categoryScores[e] -= 1);
         engagePost(nextPost, -5);
+        updateTaste(nextPost, -0.1);
         postsWithoutLike++;
         document.querySelector(".posts").appendChild(postDiv);
     }
@@ -1077,7 +1172,7 @@
             const initialScore = (post.thumb ? 5 : 0) + (3**(post.seen??0)-1)*-50000;
             const postScore = [...post.allCategories].reduce((sum, cat) => sum + (categoryScores[cat]??0), initialScore);
             // intentionally do this to the original obj instance
-            post.score = postScore;
+            post.score = postScore + W * cosineTaste(post);
             return post;
         });
 
@@ -1225,6 +1320,16 @@ async function* streamToAsyncIterable(stream) {
         const smoldata = await getFileWithProgress(DATA_URL);
         downloadFinished = true;
 
+        // load embeddings.bin (int8, one 384-dim vector per page, same order as smoldata.pages)
+        try {
+            const embResp = await fetch("embeddings.bin");
+            const embBuf = await embResp.arrayBuffer();
+            embeddings = new Int8Array(embBuf);
+            console.log("embeddings loaded:", embeddings.length / EMBED_DIM, "vectors");
+        } catch (e) {
+            console.warn("embeddings.bin missing — taste vector disabled", e);
+        }
+
         const subCategories = smoldata.subCategories;
         noPageMaps = smoldata.noPageMaps;
         delete smoldata.subCategories;
@@ -1238,6 +1343,7 @@ async function* streamToAsyncIterable(stream) {
         while (smoldata.pages.length) {
             const e = smoldata.pages.pop();
             const tempPage = {title:e[0],id:e[1],text:e[2],thumb:e[3],categories:e[4],links:e[5]};
+            tempPage.originalIndex = wikiLen - 1 - i;
             if (i % 1000 == 0 && Date.now() - lastFrame > 20) {
                 loadStatus(`${(i/wikiLen*100).toFixed(0)}%`);
                 await new Promise(e => requestAnimationFrame(e));
